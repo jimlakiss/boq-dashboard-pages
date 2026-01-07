@@ -13,3 +13,4 @@ CODE,DESCRIPTION,QTY,UNIT,RATE,SUBTOTAL,MARKUP,TOTAL
 08.RE.0.1.0.0.0.R1,Rebar Supply & Fix,3.2,t,2100,6720,5%,7056
 08.RE.0.2.1.0.0,Footings,,,,,,
 08.RE.0.2.1.0.0.R0,Helical Bars To Footings - Labour Only Excludes material & plant,1,t,3500,3500,,3500
+08.RE.0.2.1.0.0.R1,Helical Bars To Footings - R6 Bars including labour & small hand held plant,2,t,2500,2500,,5000
