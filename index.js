@@ -1,9 +1,17 @@
 /*************************************************************
- * BOQ CSV + HIERARCHY + COLLAPSE + ROLLUP ENGINE
- * FINAL FIX:
- * - Rollups are VALUE-BASED, not STRUCTURE-BASED
+ * BOQ CSV (AUTO-LOAD) + HIERARCHY + COLLAPSE + ROLLUP ENGINE
+ *
+ * THIS REVISION:
+ * - Keeps previous working render/UI/CSS behaviour (no layout changes)
+ * - Fixes rollups so parents sum:
+ *    (a) rate rows (.R#)
+ *    (b) non-rate rows that carry values (QTY/SUBTOTAL/TOTAL != 0),
+ *        even if those rows have children (e.g. "Trench Mesh" case)
+ *
+ * No Bootstrap. Tailwind layout unchanged.
  *************************************************************/
 
+/* ================= COLUMN MAP ================= */
 const COL = {
   CODE: 0,
   DESC: 1,
@@ -15,11 +23,11 @@ const COL = {
   TOTAL: 7
 };
 
-const INDENT_PX = 14;
+/* ================= CONFIG ================= */
+const INDENT_PX = 14;           // ~3–5mm
 const AUTO_CSV_PATH = "./boq.csv";
 
-/* ================= UTILITIES ================= */
-
+/* ================= CODE UTILITIES ================= */
 function isRate(code) {
   return /\.R\d+$/.test(code || "");
 }
@@ -29,8 +37,8 @@ function stripRate(code) {
 }
 
 function tradePrefix(code) {
-  const p = stripRate(code).split(".");
-  return p.length >= 2 ? `${p[0]}.${p[1]}` : "";
+  const parts = stripRate(code).split(".");
+  return parts.length >= 2 ? `${parts[0]}.${parts[1]}` : "";
 }
 
 function numericSlots(code) {
@@ -41,186 +49,393 @@ function nonZeroCount(code) {
   return numericSlots(code).reduce((a, n) => a + (n !== 0 ? 1 : 0), 0);
 }
 
-function covers(parent, child) {
-  if (!parent || !child) return false;
-  if (tradePrefix(parent) !== tradePrefix(child)) return false;
+/**
+ * Covers relationship:
+ * parent covers child if all parent non-zero slots match child's slots.
+ */
+function covers(parentCode, childCode) {
+  if (!parentCode || !childCode) return false;
+  if (tradePrefix(parentCode) !== tradePrefix(childCode)) return false;
 
-  const p = numericSlots(parent);
-  const c = numericSlots(child);
+  const p = numericSlots(parentCode);
+  const c = numericSlots(childCode);
   for (let i = 0; i < p.length; i++) {
     if (p[i] !== 0 && p[i] !== c[i]) return false;
   }
   return true;
 }
 
-function isDescendant(parent, child) {
-  if (!parent || !child) return false;
-  if (stripRate(parent) === stripRate(child)) return false;
-  if (isRate(child)) return false;
-  return covers(parent, child);
+function isDescendant(parentCode, childCode) {
+  if (!parentCode || !childCode) return false;
+  if (stripRate(parentCode) === stripRate(childCode)) return false;
+  if (isRate(childCode)) return false; // rates handled via base
+  return covers(parentCode, childCode);
 }
 
+/* ================= DOM HELPERS ================= */
 function rows() {
   return Array.from(document.querySelectorAll(".boq-row[data-code]"));
 }
 
-function num(v) {
-  const n = parseFloat(String(v).replace(/[$,\s]/g, ""));
+/* ================= NUMBER HELPERS ================= */
+function parseNumber(v) {
+  const n = parseFloat(String(v ?? "").replace(/,/g, "").trim());
   return Number.isFinite(n) ? n : 0;
 }
 
-function money(n) {
+function parseMoney(v) {
+  const n = parseFloat(String(v ?? "").replace(/[$,\s]/g, "").trim());
+  return Number.isFinite(n) ? n : 0;
+}
+
+function formatMoney(n) {
   return "$" + n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 }
 
-/* ================= HIERARCHY ================= */
+/* ============================================================
+ * HIERARCHY INDEX (unchanged)
+ * Parent = most specific PRIOR row that covers the child
+ * Rates attach to their base code.
+ * ============================================================ */
+function buildHierarchyIndex(allRows) {
+  const nodes = allRows
+    .map((r, idx) => ({ el: r, code: r.dataset.code, idx }))
+    .filter(x => x.code && !isRate(x.code));
 
-function buildHierarchy(all) {
-  const nodes = all
-    .map((r, i) => ({ code: r.dataset.code, idx: i }))
-    .filter(n => n.code && !isRate(n.code));
+  const parentOf = new Map();        // code -> parentCode|null
+  const childrenOf = new Map();      // code -> [child codes]
+  const rateChildrenOf = new Map();  // baseCode -> [rate codes]
+  const depthOf = new Map();         // code -> UI depth
 
-  const parentOf = new Map();
-  const childrenOf = new Map();
-  const rateChildrenOf = new Map();
-  const depthOf = new Map();
-
-  nodes.forEach(n => {
+  for (const n of nodes) {
     childrenOf.set(n.code, []);
     rateChildrenOf.set(n.code, []);
-  });
-
-  nodes.forEach(n => {
-    let best = null, bestSpec = -1, bestIdx = -1;
-    nodes.forEach(p => {
-      if (p.idx >= n.idx) return;
-      if (!covers(p.code, n.code)) return;
-      const s = nonZeroCount(p.code);
-      if (s > bestSpec || (s === bestSpec && p.idx > bestIdx)) {
-        best = p.code; bestSpec = s; bestIdx = p.idx;
-      }
-    });
-    parentOf.set(n.code, best);
-    if (best) childrenOf.get(best).push(n.code);
-  });
-
-  all.forEach(r => {
-    if (isRate(r.dataset.code)) {
-      const base = stripRate(r.dataset.code);
-      rateChildrenOf.get(base)?.push(r.dataset.code);
-    }
-  });
-
-  function depth(c) {
-    if (depthOf.has(c)) return depthOf.get(c);
-    const d = parentOf.get(c) ? depth(parentOf.get(c)) + 1 : 0;
-    depthOf.set(c, d);
-    return d;
   }
 
-  nodes.forEach(n => depth(n.code));
+  for (const n of nodes) {
+    let bestParent = null;
+    let bestSpec = -1;
+    let bestIdx = -1;
+
+    for (const p of nodes) {
+      if (p.idx >= n.idx) break; // prior rows only
+      if (!covers(p.code, n.code)) continue;
+
+      const spec = nonZeroCount(p.code);
+      if (spec > bestSpec || (spec === bestSpec && p.idx > bestIdx)) {
+        bestParent = p.code;
+        bestSpec = spec;
+        bestIdx = p.idx;
+      }
+    }
+
+    if (bestParent === n.code) bestParent = null;
+
+    parentOf.set(n.code, bestParent);
+    if (bestParent && childrenOf.has(bestParent)) {
+      childrenOf.get(bestParent).push(n.code);
+    }
+  }
+
+  // Attach rate rows
+  for (const r of allRows) {
+    const c = r.dataset.code;
+    if (!c || !isRate(c)) continue;
+    const base = stripRate(c);
+    if (!rateChildrenOf.has(base)) rateChildrenOf.set(base, []);
+    rateChildrenOf.get(base).push(c);
+  }
+
+  // Compute depth
+  function computeDepth(code) {
+    if (depthOf.has(code)) return depthOf.get(code);
+    const p = parentOf.get(code);
+    const d = p ? computeDepth(p) + 1 : 0;
+    depthOf.set(code, d);
+    return d;
+  }
+  for (const n of nodes) computeDepth(n.code);
 
   return { parentOf, childrenOf, rateChildrenOf, depthOf };
 }
 
-/* ================= ROLLUPS (FIXED) ================= */
+function hasChildren(code, hierarchy) {
+  if (!code || isRate(code)) return false;
+  const { childrenOf, rateChildrenOf } = hierarchy;
+  return (childrenOf.get(code)?.length || 0) > 0 || (rateChildrenOf.get(code)?.length || 0) > 0;
+}
 
-function recomputeAllRollups(all, hierarchy) {
-  const parents = all.filter(r => !isRate(r.dataset.code));
+/* ============================================================
+ * PRESENTATION (unchanged from working GH Pages version)
+ * Applies AFTER CODE cell rebuild, uses !important to win.
+ * Level 1: bold + underline + lighter grey + subtle shading
+ * Level 2+: bold description
+ * Rates: unchanged
+ * ============================================================ */
+function applyLevelPresentation(rowEl, code, codeCell, descCell, hierarchy) {
+  rowEl.style.removeProperty("background-color");
 
-  parents.forEach(p => {
-    let q = 0, s = 0, t = 0;
-    const pCode = p.dataset.code;
+  if (isRate(code)) return;
 
-    all.forEach(r => {
+  const depth = hierarchy.depthOf.get(code) || 0;
+
+  if (depth === 0) {
+    rowEl.style.setProperty("background-color", "#f1f5f9", "important"); // slate-100
+
+    if (codeCell) {
+      codeCell.style.setProperty("color", "#64748b", "important"); // slate-500
+      codeCell.style.setProperty("font-weight", "700", "important");
+      codeCell.style.setProperty("text-decoration", "underline", "important");
+
+      const labelSpan = codeCell.querySelector("span:last-child");
+      if (labelSpan) {
+        labelSpan.style.setProperty("color", "#64748b", "important");
+        labelSpan.style.setProperty("font-weight", "700", "important");
+        labelSpan.style.setProperty("text-decoration", "underline", "important");
+      }
+    }
+
+    if (descCell) {
+      descCell.style.setProperty("color", "#64748b", "important");
+      descCell.style.setProperty("font-weight", "700", "important");
+      descCell.style.setProperty("text-decoration", "underline", "important");
+    }
+  } else {
+    if (descCell) {
+      descCell.style.setProperty("font-weight", "700", "important");
+    }
+  }
+}
+
+/* ============================================================
+ * ROLLUPS (FIXED, value-based contribution)
+ *
+ * A row contributes to rollups if:
+ * - it is a RATE row, OR
+ * - it carries any values (QTY or SUBTOTAL or TOTAL != 0)
+ *
+ * This fixes cases like "Trench Mesh" where a non-rate row has children
+ * but still contains quantities that must roll up.
+ * ============================================================ */
+function rowHasValues(rowEl) {
+  const qty = parseNumber(rowEl.children[COL.QTY]?.textContent);
+  const sub = parseMoney(rowEl.children[COL.SUBTOTAL]?.textContent);
+  const tot = parseMoney(rowEl.children[COL.TOTAL]?.textContent);
+  return qty !== 0 || sub !== 0 || tot !== 0;
+}
+
+function recomputeAllRollups(allRows, hierarchy) {
+  const nodes = allRows.filter(r => r.dataset.code && !isRate(r.dataset.code));
+
+  for (const node of nodes) {
+    const nCode = node.dataset.code;
+    let qty = 0, subtotal = 0, total = 0;
+
+    for (const r of allRows) {
       const rCode = r.dataset.code;
-      if (!rCode) return;
+      if (!rCode) continue;
 
-      const hasValues =
-        num(r.children[COL.QTY]?.textContent) !== 0 ||
-        num(r.children[COL.SUBTOTAL]?.textContent) !== 0 ||
-        num(r.children[COL.TOTAL]?.textContent) !== 0;
-
-      if (!hasValues && !isRate(rCode)) return;
+      const contributes = isRate(rCode) || rowHasValues(r);
+      if (!contributes) continue;
 
       const base = stripRate(rCode);
-      if (base === pCode || isDescendant(pCode, base)) {
-        q += num(r.children[COL.QTY]?.textContent);
-        s += num(r.children[COL.SUBTOTAL]?.textContent);
-        t += num(r.children[COL.TOTAL]?.textContent);
+
+      if (base === nCode || isDescendant(nCode, base)) {
+        qty += parseNumber(r.children[COL.QTY]?.textContent || 0);
+        subtotal += parseMoney(r.children[COL.SUBTOTAL]?.textContent || 0);
+        total += parseMoney(r.children[COL.TOTAL]?.textContent || 0);
       }
+    }
+
+    node.children[COL.QTY].textContent = qty ? String(qty) : "";
+    node.children[COL.SUBTOTAL].textContent = formatMoney(subtotal);
+    node.children[COL.TOTAL].textContent = formatMoney(total);
+  }
+}
+
+/* ================= VISIBILITY (unchanged) ================= */
+function hideSubtree(code, allRows, hierarchy) {
+  const { childrenOf, rateChildrenOf } = hierarchy;
+
+  (rateChildrenOf.get(code) || []).forEach(rc => {
+    const el = allRows.find(r => r.dataset.code === rc);
+    if (el) el.style.display = "none";
+  });
+
+  (childrenOf.get(code) || []).forEach(child => {
+    const el = allRows.find(r => r.dataset.code === child);
+    if (el) {
+      el.style.display = "none";
+      el.classList.add("collapsed");
+      el.classList.remove("expanded");
+    }
+    hideSubtree(child, allRows, hierarchy);
+  });
+}
+
+function showImmediateChildren(code, allRows, hierarchy) {
+  const { childrenOf, rateChildrenOf } = hierarchy;
+
+  (childrenOf.get(code) || []).forEach(child => {
+    const el = allRows.find(r => r.dataset.code === child);
+    if (el) el.style.display = "grid";
+  });
+
+  (rateChildrenOf.get(code) || []).forEach(rc => {
+    const el = allRows.find(r => r.dataset.code === rc);
+    if (el) el.style.display = "grid";
+  });
+}
+
+/* ================= UI INIT (unchanged) ================= */
+function initBoqUI(allRows, hierarchy) {
+  const { depthOf } = hierarchy;
+
+  for (const r of allRows) {
+    const code = r.dataset.code;
+    if (!code) continue;
+
+    const codeCell = r.children[COL.CODE];
+    const descCell = r.children[COL.DESC];
+    if (!codeCell || !descCell) continue;
+
+    // Indentation
+    if (!isRate(code)) {
+      const d = depthOf.get(code) || 0;
+      descCell.style.setProperty("padding-left", `${d * INDENT_PX}px`, "important");
+    } else {
+      const base = stripRate(code);
+      const pd = depthOf.get(base) || 0;
+      descCell.style.setProperty("padding-left", `${(pd + 1) * INDENT_PX}px`, "important");
+    }
+
+    // Rebuild CODE cell
+    const codeLabel = code;
+    codeCell.innerHTML = "";
+    const wrap = document.createElement("div");
+    wrap.className = "flex items-center gap-2 select-none";
+
+    if (!isRate(code) && hasChildren(code, hierarchy)) {
+      const icon = document.createElement("span");
+      icon.textContent = r.classList.contains("expanded") ? "▾" : "▸";
+      icon.className = "text-slate-500";
+      wrap.appendChild(icon);
+
+      codeCell.classList.add("cursor-pointer", "text-blue-700");
+
+      codeCell.addEventListener("click", () => {
+        const isExpanded = r.classList.contains("expanded");
+        if (isExpanded) {
+          r.classList.remove("expanded");
+          r.classList.add("collapsed");
+          icon.textContent = "▸";
+          hideSubtree(code, allRows, hierarchy);
+        } else {
+          r.classList.add("expanded");
+          r.classList.remove("collapsed");
+          icon.textContent = "▾";
+          showImmediateChildren(code, allRows, hierarchy);
+        }
+      });
+    }
+
+    const label = document.createElement("span");
+    label.textContent = codeLabel;
+    wrap.appendChild(label);
+    codeCell.appendChild(wrap);
+
+    // Apply presentation AFTER rebuild
+    applyLevelPresentation(r, code, codeCell, descCell, hierarchy);
+  }
+}
+
+/* ================= CSV LOAD (unchanged) ================= */
+function parseCSV(text) {
+  const lines = text.trim().split(/\r?\n/);
+  lines.shift(); // headers
+  return lines
+    .filter(l => l.trim().length > 0)
+    .map(l => {
+      const v = l.split(",");
+      return {
+        CODE: (v[0] ?? "").trim(),
+        DESCRIPTION: (v[1] ?? "").trim(),
+        QTY: (v[2] ?? "").trim(),
+        UNIT: (v[3] ?? "").trim(),
+        RATE: (v[4] ?? "").trim(),
+        SUBTOTAL: (v[5] ?? "").trim(),
+        MARKUP: (v[6] ?? "").trim(),
+        TOTAL: (v[7] ?? "").trim()
+      };
     });
-
-    p.children[COL.QTY].textContent = q || "";
-    p.children[COL.SUBTOTAL].textContent = money(s);
-    p.children[COL.TOTAL].textContent = money(t);
-  });
 }
 
-/* ================= VISIBILITY ================= */
-
-function hideSubtree(code, all, h) {
-  h.rateChildrenOf.get(code)?.forEach(c =>
-    all.find(r => r.dataset.code === c).style.display = "none"
-  );
-  h.childrenOf.get(code)?.forEach(c => {
-    const el = all.find(r => r.dataset.code === c);
-    el.style.display = "none";
-    el.classList.add("collapsed");
-    hideSubtree(c, all, h);
-  });
+function clearBoq() {
+  document.querySelectorAll(".boq-row").forEach(r => r.remove());
 }
 
-function showChildren(code, all, h) {
-  h.childrenOf.get(code)?.forEach(c =>
-    all.find(r => r.dataset.code === c).style.display = "grid"
-  );
-  h.rateChildrenOf.get(code)?.forEach(c =>
-    all.find(r => r.dataset.code === c).style.display = "grid"
-  );
-}
-
-/* ================= INIT ================= */
-
-document.addEventListener("DOMContentLoaded", async () => {
-  const csv = await fetch(AUTO_CSV_PATH).then(r => r.text());
-  const rowsData = csv.trim().split(/\r?\n/).slice(1).map(l => l.split(","));
-
+function renderFromCSV(data) {
   const container = document.getElementById("boqContainer");
-  container.innerHTML = "";
 
-  rowsData.forEach(r => {
+  data.forEach(row => {
     const el = document.createElement("div");
     el.className = "boq-row boq-grid px-3 py-2";
-    el.dataset.code = r[0];
-    if (isRate(r[0])) el.classList.add("bg-sky-100", "rounded-md", "mx-2");
+    el.dataset.code = row.CODE;
 
-    el.innerHTML = r.map((c, i) =>
-      `<div class="${i > 1 ? "text-right" : ""}">${c || ""}</div>`
-    ).join("");
+    // Rate rows stay light blue
+    if (isRate(row.CODE)) {
+      el.classList.add("bg-sky-100", "mx-2", "my-1", "rounded-md");
+    }
+
+    el.innerHTML = `
+      <div></div>
+      <div>${row.DESCRIPTION || ""}</div>
+      <div class="text-right">${row.QTY || ""}</div>
+      <div class="text-right">${row.UNIT || ""}</div>
+      <div class="text-right">${row.RATE || ""}</div>
+      <div class="text-right">${row.SUBTOTAL || ""}</div>
+      <div class="text-right">${row.MARKUP || ""}</div>
+      <div class="text-right">${row.TOTAL || ""}</div>
+    `;
+
     container.appendChild(el);
   });
+}
+
+/* ================= STARTUP (unchanged) ================= */
+document.addEventListener("DOMContentLoaded", async () => {
+  const res = await fetch(AUTO_CSV_PATH, { cache: "no-store" });
+  const text = await res.text();
+  const data = parseCSV(text);
+
+  clearBoq();
+  renderFromCSV(data);
 
   const all = rows();
-  const h = buildHierarchy(all);
+  const hierarchy = buildHierarchyIndex(all);
 
-  all.forEach(r => {
-    if (isRate(r.dataset.code)) r.style.display = "none";
-    else if (!h.parentOf.get(r.dataset.code)) r.style.display = "grid";
-    else r.style.display = "none";
-  });
-
-  all.forEach(r => {
+  // Initial visibility: show only root headings; hide all others
+  for (const r of all) {
     const code = r.dataset.code;
-    const cell = r.children[COL.CODE];
-    if (!isRate(code) && (h.childrenOf.get(code)?.length || h.rateChildrenOf.get(code)?.length)) {
-      cell.onclick = () => {
-        const open = r.classList.toggle("expanded");
-        if (open) showChildren(code, all, h);
-        else hideSubtree(code, all, h);
-      };
-    }
-  });
+    if (!code) continue;
 
-  recomputeAllRollups(all, h);
+    if (isRate(code)) {
+      r.style.display = "none";
+      continue;
+    }
+
+    const parent = hierarchy.parentOf.get(code);
+    if (parent === null) {
+      r.style.display = "grid";
+      r.classList.add("collapsed");
+      r.classList.remove("expanded");
+    } else {
+      r.style.display = "none";
+      r.classList.add("collapsed");
+      r.classList.remove("expanded");
+    }
+  }
+
+  initBoqUI(all, hierarchy);
+  recomputeAllRollups(all, hierarchy);
 });
