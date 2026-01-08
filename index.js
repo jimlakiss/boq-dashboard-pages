@@ -1,21 +1,9 @@
 /*************************************************************
- * BOQ CSV (AUTO-LOAD) + HIERARCHY + COLLAPSE + ROLLUP ENGINE
- *
- * REQUIRED FIXES:
- * 1) Heading emphasis MUST show (even if your CSS uses !important):
- *    - Level 1 (trade roots): bold + underline + lighter grey text + subtle grey row shading
- *    - Level 2+ headings (non-rate): bold
- *    - Rates: unchanged (light blue background)
- *
- * 2) Rollups MUST include:
- *    - Rate rows (.R#)
- *    - Non-rate TRUE LEAF rows carrying quantities (fixes "Trench mesh" style cases)
- *
- * NO BOOTSTRAP (none referenced/used)
+ * BOQ CSV + HIERARCHY + COLLAPSE + ROLLUP ENGINE
+ * FINAL FIX:
+ * - Rollups are VALUE-BASED, not STRUCTURE-BASED
  *************************************************************/
-console.log("✅ BOQ index.js loaded:", new Date().toISOString());
-document.documentElement.style.setProperty("outline", "6px solid magenta", "important");
-/* ================= COLUMN MAP ================= */
+
 const COL = {
   CODE: 0,
   DESC: 1,
@@ -27,11 +15,11 @@ const COL = {
   TOTAL: 7
 };
 
-/* ================= CONFIG ================= */
-const INDENT_PX = 14;           // ~3–5mm
-const AUTO_CSV_PATH = "boq.csv";
+const INDENT_PX = 14;
+const AUTO_CSV_PATH = "./boq.csv";
 
-/* ================= CODE UTILITIES ================= */
+/* ================= UTILITIES ================= */
+
 function isRate(code) {
   return /\.R\d+$/.test(code || "");
 }
@@ -41,8 +29,8 @@ function stripRate(code) {
 }
 
 function tradePrefix(code) {
-  const parts = stripRate(code).split(".");
-  return parts.length >= 2 ? `${parts[0]}.${parts[1]}` : "";
+  const p = stripRate(code).split(".");
+  return p.length >= 2 ? `${p[0]}.${p[1]}` : "";
 }
 
 function numericSlots(code) {
@@ -53,411 +41,186 @@ function nonZeroCount(code) {
   return numericSlots(code).reduce((a, n) => a + (n !== 0 ? 1 : 0), 0);
 }
 
-/**
- * Covers relationship:
- * parent covers child if all parent non-zero slots match child's slots.
- */
-function covers(parentCode, childCode) {
-  if (!parentCode || !childCode) return false;
-  if (tradePrefix(parentCode) !== tradePrefix(childCode)) return false;
+function covers(parent, child) {
+  if (!parent || !child) return false;
+  if (tradePrefix(parent) !== tradePrefix(child)) return false;
 
-  const p = numericSlots(parentCode);
-  const c = numericSlots(childCode);
+  const p = numericSlots(parent);
+  const c = numericSlots(child);
   for (let i = 0; i < p.length; i++) {
     if (p[i] !== 0 && p[i] !== c[i]) return false;
   }
   return true;
 }
 
-function isDescendant(parentCode, childCode) {
-  if (!parentCode || !childCode) return false;
-  if (stripRate(parentCode) === stripRate(childCode)) return false;
-  if (isRate(childCode)) return false;
-  return covers(parentCode, childCode);
+function isDescendant(parent, child) {
+  if (!parent || !child) return false;
+  if (stripRate(parent) === stripRate(child)) return false;
+  if (isRate(child)) return false;
+  return covers(parent, child);
 }
 
-/* ================= DOM HELPERS ================= */
 function rows() {
   return Array.from(document.querySelectorAll(".boq-row[data-code]"));
 }
 
-/* ================= NUMBER HELPERS ================= */
-function parseNumber(v) {
-  const n = parseFloat(String(v).replace(/,/g, ""));
-  return Number.isFinite(n) ? n : 0;
-}
-
-function parseMoney(v) {
+function num(v) {
   const n = parseFloat(String(v).replace(/[$,\s]/g, ""));
   return Number.isFinite(n) ? n : 0;
 }
 
-function formatMoney(n) {
-  // If you prefer blank instead of $0.00, adjust here (not touched otherwise).
+function money(n) {
   return "$" + n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 }
 
-/* ============================================================
- * HIERARCHY INDEX
- * Parent = most specific PRIOR row that covers the child
- * Rates attach to their base code.
- * ============================================================ */
-function buildHierarchyIndex(allRows) {
-  const nodes = allRows
-    .map((r, idx) => ({ code: r.dataset.code, idx }))
-    .filter(x => x.code && !isRate(x.code));
+/* ================= HIERARCHY ================= */
 
-  const parentOf = new Map();        // code -> parentCode|null
-  const childrenOf = new Map();      // code -> [child codes] (non-rate)
-  const rateChildrenOf = new Map();  // baseCode -> [rate codes]
-  const depthOf = new Map();         // code -> UI depth
+function buildHierarchy(all) {
+  const nodes = all
+    .map((r, i) => ({ code: r.dataset.code, idx: i }))
+    .filter(n => n.code && !isRate(n.code));
 
-  for (const n of nodes) {
+  const parentOf = new Map();
+  const childrenOf = new Map();
+  const rateChildrenOf = new Map();
+  const depthOf = new Map();
+
+  nodes.forEach(n => {
     childrenOf.set(n.code, []);
     rateChildrenOf.set(n.code, []);
-  }
+  });
 
-  for (const n of nodes) {
-    let bestParent = null;
-    let bestSpec = -1;
-    let bestIdx = -1;
-
-    for (const p of nodes) {
-      if (p.idx >= n.idx) break; // prior only
-      if (!covers(p.code, n.code)) continue;
-
-      const spec = nonZeroCount(p.code);
-      if (spec > bestSpec || (spec === bestSpec && p.idx > bestIdx)) {
-        bestParent = p.code;
-        bestSpec = spec;
-        bestIdx = p.idx;
+  nodes.forEach(n => {
+    let best = null, bestSpec = -1, bestIdx = -1;
+    nodes.forEach(p => {
+      if (p.idx >= n.idx) return;
+      if (!covers(p.code, n.code)) return;
+      const s = nonZeroCount(p.code);
+      if (s > bestSpec || (s === bestSpec && p.idx > bestIdx)) {
+        best = p.code; bestSpec = s; bestIdx = p.idx;
       }
+    });
+    parentOf.set(n.code, best);
+    if (best) childrenOf.get(best).push(n.code);
+  });
+
+  all.forEach(r => {
+    if (isRate(r.dataset.code)) {
+      const base = stripRate(r.dataset.code);
+      rateChildrenOf.get(base)?.push(r.dataset.code);
     }
+  });
 
-    if (bestParent === n.code) bestParent = null;
-
-    parentOf.set(n.code, bestParent);
-    if (bestParent && childrenOf.has(bestParent)) {
-      childrenOf.get(bestParent).push(n.code);
-    }
-  }
-
-  // attach rates
-  for (const r of allRows) {
-    const code = r.dataset.code;
-    if (!code || !isRate(code)) continue;
-    const base = stripRate(code);
-    if (!rateChildrenOf.has(base)) rateChildrenOf.set(base, []);
-    rateChildrenOf.get(base).push(code);
-  }
-
-  // compute depth by parent chain
-  function computeDepth(code) {
-    if (depthOf.has(code)) return depthOf.get(code);
-    const p = parentOf.get(code);
-    const d = p ? computeDepth(p) + 1 : 0;
-    depthOf.set(code, d);
+  function depth(c) {
+    if (depthOf.has(c)) return depthOf.get(c);
+    const d = parentOf.get(c) ? depth(parentOf.get(c)) + 1 : 0;
+    depthOf.set(c, d);
     return d;
   }
-  for (const n of nodes) computeDepth(n.code);
+
+  nodes.forEach(n => depth(n.code));
 
   return { parentOf, childrenOf, rateChildrenOf, depthOf };
 }
 
-function hasChildren(code, hierarchy) {
-  if (!code || isRate(code)) return false;
-  const { childrenOf, rateChildrenOf } = hierarchy;
-  return (childrenOf.get(code)?.length || 0) > 0 || (rateChildrenOf.get(code)?.length || 0) > 0;
-}
+/* ================= ROLLUPS (FIXED) ================= */
 
-/**
- * TRUE LEAF = no non-rate children AND no attached rates
- * (Only these non-rate rows should contribute upward directly.)
- */
-function isTrueLeafNonRate(code, hierarchy) {
-  if (!code || isRate(code)) return false;
-  const { childrenOf, rateChildrenOf } = hierarchy;
-  const hasNonRateKids = (childrenOf.get(code)?.length || 0) > 0;
-  const hasRates = (rateChildrenOf.get(code)?.length || 0) > 0;
-  return !hasNonRateKids && !hasRates;
-}
+function recomputeAllRollups(all, hierarchy) {
+  const parents = all.filter(r => !isRate(r.dataset.code));
 
-/* ============================================================
- * ROLLUPS (FIXED)
- * Include:
- * - Rate rows always
- * - Non-rate TRUE LEAF rows that carry quantities
- * ============================================================ */
-function recomputeAllRollups(allRows, hierarchy) {
-  const nodes = allRows.filter(r => r.dataset.code && !isRate(r.dataset.code));
+  parents.forEach(p => {
+    let q = 0, s = 0, t = 0;
+    const pCode = p.dataset.code;
 
-  for (const node of nodes) {
-    const nCode = node.dataset.code;
-    let qty = 0, subtotal = 0, total = 0;
-
-    for (const r of allRows) {
+    all.forEach(r => {
       const rCode = r.dataset.code;
-      if (!rCode) continue;
+      if (!rCode) return;
 
-      const contribute =
-        isRate(rCode) ||
-        (isTrueLeafNonRate(rCode, hierarchy)); // <- key fix
+      const hasValues =
+        num(r.children[COL.QTY]?.textContent) !== 0 ||
+        num(r.children[COL.SUBTOTAL]?.textContent) !== 0 ||
+        num(r.children[COL.TOTAL]?.textContent) !== 0;
 
-      if (!contribute) continue;
+      if (!hasValues && !isRate(rCode)) return;
 
-      const base = stripRate(rCode); // for non-rate this is itself
-      if (base === nCode || isDescendant(nCode, base)) {
-        qty += parseNumber(r.children[COL.QTY]?.textContent || 0);
-        subtotal += parseMoney(r.children[COL.SUBTOTAL]?.textContent || 0);
-        total += parseMoney(r.children[COL.TOTAL]?.textContent || 0);
+      const base = stripRate(rCode);
+      if (base === pCode || isDescendant(pCode, base)) {
+        q += num(r.children[COL.QTY]?.textContent);
+        s += num(r.children[COL.SUBTOTAL]?.textContent);
+        t += num(r.children[COL.TOTAL]?.textContent);
       }
-    }
+    });
 
-    node.children[COL.QTY].textContent = qty ? String(qty) : "";
-    node.children[COL.SUBTOTAL].textContent = formatMoney(subtotal);
-    node.children[COL.TOTAL].textContent = formatMoney(total);
-  }
+    p.children[COL.QTY].textContent = q || "";
+    p.children[COL.SUBTOTAL].textContent = money(s);
+    p.children[COL.TOTAL].textContent = money(t);
+  });
 }
 
 /* ================= VISIBILITY ================= */
-function hideSubtree(code, allRows, hierarchy) {
-  const { childrenOf, rateChildrenOf } = hierarchy;
 
-  // hide attached rates
-  (rateChildrenOf.get(code) || []).forEach(rc => {
-    const el = allRows.find(r => r.dataset.code === rc);
-    if (el) el.style.display = "none";
-  });
-
-  // hide children and recurse
-  (childrenOf.get(code) || []).forEach(child => {
-    const el = allRows.find(r => r.dataset.code === child);
-    if (el) {
-      el.style.display = "none";
-      el.classList.add("collapsed");
-      el.classList.remove("expanded");
-    }
-    hideSubtree(child, allRows, hierarchy);
+function hideSubtree(code, all, h) {
+  h.rateChildrenOf.get(code)?.forEach(c =>
+    all.find(r => r.dataset.code === c).style.display = "none"
+  );
+  h.childrenOf.get(code)?.forEach(c => {
+    const el = all.find(r => r.dataset.code === c);
+    el.style.display = "none";
+    el.classList.add("collapsed");
+    hideSubtree(c, all, h);
   });
 }
 
-function showImmediateChildren(code, allRows, hierarchy) {
-  const { childrenOf, rateChildrenOf } = hierarchy;
-
-  // show only immediate children
-  (childrenOf.get(code) || []).forEach(child => {
-    const el = allRows.find(r => r.dataset.code === child);
-    if (el) el.style.display = "grid";
-  });
-
-  // show only rates directly attached to this node
-  (rateChildrenOf.get(code) || []).forEach(rc => {
-    const el = allRows.find(r => r.dataset.code === rc);
-    if (el) el.style.display = "grid";
-  });
+function showChildren(code, all, h) {
+  h.childrenOf.get(code)?.forEach(c =>
+    all.find(r => r.dataset.code === c).style.display = "grid"
+  );
+  h.rateChildrenOf.get(code)?.forEach(c =>
+    all.find(r => r.dataset.code === c).style.display = "grid"
+  );
 }
 
-/* ============================================================
- * PRESENTATION (GUARANTEED, even against external CSS !important)
- * Apply AFTER rebuilding CODE cell.
- *
- * Level 1: bold + underline + slate grey + subtle grey row shading
- * Level 2+: bold (desc only)
- * Rates: unchanged
- * ============================================================ */
-function applyLevelPresentation(rowEl, code, codeCell, descCell, hierarchy) {
-  // reset to avoid stacking
-  rowEl.style.removeProperty("background-color");
+/* ================= INIT ================= */
 
-  // Rates unchanged
-  if (isRate(code)) return;
+document.addEventListener("DOMContentLoaded", async () => {
+  const csv = await fetch(AUTO_CSV_PATH).then(r => r.text());
+  const rowsData = csv.trim().split(/\r?\n/).slice(1).map(l => l.split(","));
 
-  const depth = hierarchy.depthOf.get(code) || 0;
-
-  if (depth === 0) {
-    // subtle row shading
-    rowEl.style.setProperty("background-color", "#f1f5f9", "important"); // slate-100
-
-    // CODE cell (and its label) - grey, bold, underline
-    if (codeCell) {
-      codeCell.style.setProperty("color", "#64748b", "important"); // slate-500
-      codeCell.style.setProperty("font-weight", "700", "important");
-      codeCell.style.setProperty("text-decoration", "underline", "important");
-
-      // also force the inner label span (some CSS targets spans)
-      const labelSpan = codeCell.querySelector("span:last-child");
-      if (labelSpan) {
-        labelSpan.style.setProperty("color", "#64748b", "important");
-        labelSpan.style.setProperty("font-weight", "700", "important");
-        labelSpan.style.setProperty("text-decoration", "underline", "important");
-      }
-    }
-
-    // DESCRIPTION cell - same emphasis
-    if (descCell) {
-      descCell.style.setProperty("color", "#64748b", "important");
-      descCell.style.setProperty("font-weight", "700", "important");
-      descCell.style.setProperty("text-decoration", "underline", "important");
-    }
-  } else {
-    // Level 2+ headings: bold description
-    if (descCell) {
-      descCell.style.setProperty("font-weight", "700", "important");
-      descCell.style.removeProperty("text-decoration"); // leave default
-    }
-  }
-}
-
-/* ================= UI INIT ================= */
-function initBoqUI(allRows, hierarchy) {
-  const { depthOf } = hierarchy;
-
-  for (const r of allRows) {
-    const code = r.dataset.code;
-    if (!code) continue;
-
-    const codeCell = r.children[COL.CODE];
-    const descCell = r.children[COL.DESC];
-    if (!codeCell || !descCell) continue;
-
-    // indentation (unchanged intent)
-    if (!isRate(code)) {
-      const d = depthOf.get(code) || 0;
-      descCell.style.setProperty("padding-left", `${d * INDENT_PX}px`, "important");
-    } else {
-      const base = stripRate(code);
-      const pd = depthOf.get(base) || 0;
-      descCell.style.setProperty("padding-left", `${(pd + 1) * INDENT_PX}px`, "important");
-    }
-
-    // rebuild CODE cell (existing behaviour)
-    const codeLabel = code;
-    codeCell.innerHTML = "";
-    const wrap = document.createElement("div");
-    wrap.className = "flex items-center gap-2 select-none";
-
-    if (!isRate(code) && hasChildren(code, hierarchy)) {
-      const icon = document.createElement("span");
-      icon.textContent = r.classList.contains("expanded") ? "▾" : "▸";
-      icon.className = "text-slate-500";
-      wrap.appendChild(icon);
-
-      // keep clickable styling
-      codeCell.classList.add("cursor-pointer", "text-blue-700");
-
-      codeCell.addEventListener("click", () => {
-        const isExpanded = r.classList.contains("expanded");
-        if (isExpanded) {
-          r.classList.remove("expanded");
-          r.classList.add("collapsed");
-          icon.textContent = "▸";
-          hideSubtree(code, allRows, hierarchy);
-        } else {
-          r.classList.add("expanded");
-          r.classList.remove("collapsed");
-          icon.textContent = "▾";
-          showImmediateChildren(code, allRows, hierarchy);
-        }
-      });
-    }
-
-    const label = document.createElement("span");
-    label.textContent = codeLabel;
-    wrap.appendChild(label);
-    codeCell.appendChild(wrap);
-
-    // ✅ Apply presentation AFTER rebuild (and with !important)
-    applyLevelPresentation(r, code, codeCell, descCell, hierarchy);
-  }
-}
-
-/* ================= CSV LOAD ================= */
-function parseCSV(text) {
-  const lines = text.trim().split(/\r?\n/);
-  lines.shift(); // headers
-  return lines
-    .filter(l => l.trim().length > 0)
-    .map(l => {
-      const v = l.split(",");
-      return {
-        CODE: (v[0] ?? "").trim(),
-        DESCRIPTION: (v[1] ?? "").trim(),
-        QTY: (v[2] ?? "").trim(),
-        UNIT: (v[3] ?? "").trim(),
-        RATE: (v[4] ?? "").trim(),
-        SUBTOTAL: (v[5] ?? "").trim(),
-        MARKUP: (v[6] ?? "").trim(),
-        TOTAL: (v[7] ?? "").trim()
-      };
-    });
-}
-
-function clearBoq() {
-  document.querySelectorAll(".boq-row").forEach(r => r.remove());
-}
-
-function renderFromCSV(data) {
   const container = document.getElementById("boqContainer");
+  container.innerHTML = "";
 
-  data.forEach(row => {
+  rowsData.forEach(r => {
     const el = document.createElement("div");
     el.className = "boq-row boq-grid px-3 py-2";
-    el.dataset.code = row.CODE;
+    el.dataset.code = r[0];
+    if (isRate(r[0])) el.classList.add("bg-sky-100", "rounded-md", "mx-2");
 
-    // Rates stay light blue
-    if (isRate(row.CODE)) {
-      el.classList.add("bg-sky-100", "mx-2", "my-1", "rounded-md");
-    }
-
-    el.innerHTML = `
-      <div></div>
-      <div>${row.DESCRIPTION || ""}</div>
-      <div class="text-right">${row.QTY || ""}</div>
-      <div class="text-right">${row.UNIT || ""}</div>
-      <div class="text-right">${row.RATE || ""}</div>
-      <div class="text-right">${row.SUBTOTAL || ""}</div>
-      <div class="text-right">${row.MARKUP || ""}</div>
-      <div class="text-right">${row.TOTAL || ""}</div>
-    `;
-
+    el.innerHTML = r.map((c, i) =>
+      `<div class="${i > 1 ? "text-right" : ""}">${c || ""}</div>`
+    ).join("");
     container.appendChild(el);
   });
-}
-
-/* ================= STARTUP ================= */
-document.addEventListener("DOMContentLoaded", async () => {
-  const res = await fetch(AUTO_CSV_PATH, { cache: "no-store" });
-  const text = await res.text();
-  const data = parseCSV(text);
-
-  clearBoq();
-  renderFromCSV(data);
 
   const all = rows();
-  const hierarchy = buildHierarchyIndex(all);
+  const h = buildHierarchy(all);
 
-  // initial visibility: show only root headings; hide all others
-  for (const r of all) {
+  all.forEach(r => {
+    if (isRate(r.dataset.code)) r.style.display = "none";
+    else if (!h.parentOf.get(r.dataset.code)) r.style.display = "grid";
+    else r.style.display = "none";
+  });
+
+  all.forEach(r => {
     const code = r.dataset.code;
-    if (!code) continue;
-
-    if (isRate(code)) {
-      r.style.display = "none";
-      continue;
+    const cell = r.children[COL.CODE];
+    if (!isRate(code) && (h.childrenOf.get(code)?.length || h.rateChildrenOf.get(code)?.length)) {
+      cell.onclick = () => {
+        const open = r.classList.toggle("expanded");
+        if (open) showChildren(code, all, h);
+        else hideSubtree(code, all, h);
+      };
     }
+  });
 
-    const parent = hierarchy.parentOf.get(code);
-    if (parent === null) {
-      r.style.display = "grid";
-      r.classList.add("collapsed");
-      r.classList.remove("expanded");
-    } else {
-      r.style.display = "none";
-      r.classList.add("collapsed");
-      r.classList.remove("expanded");
-    }
-  }
-
-  initBoqUI(all, hierarchy);
-  recomputeAllRollups(all, hierarchy);
+  recomputeAllRollups(all, h);
 });
