@@ -3,60 +3,25 @@
    A4 Portrait (210mm) → A4 Landscape-ish (280mm)
    ========================================================= */
 
+/* PAGE WIDTH – SCREEN MODE (FULL WIDTH) */
 #boqPage {
-  min-width: 210mm;
-  max-width: 280mm;
-
+  width: 95%;
   margin-left: auto;
   margin-right: auto;
 }
 
-/* =========================================================
-   EXISTING GRID (UNCHANGED)
-   ========================================================= */
-
+/* EXISTING GRID (UNCHANGED) */
 .boq-grid {
   display: grid;
   grid-template-columns:
-    180px   /* CODE */
-    1fr     /* DESCRIPTION */
-    90px    /* QTY */
-    80px    /* UNIT */
-    110px   /* RATE */
-    130px   /* SUBTOTAL */
-    90px    /* FACTOR */
-    130px;  /* TOTAL */
+    180px
+    1fr
+    90px
+    80px
+    110px
+    130px
+    90px
+    130px;
   align-items: center;
 }
 
-@media print {
-  @page {
-    size: A4 portrait;   /* or landscape */
-    margin: 15mm;
-  }
-
-  body {
-    background: white;
-    padding: 0;
-  }
-
-  #boqPage {
-    width: 100%;
-    max-width: none;
-    box-shadow: none;
-    border-radius: 0;
-  }
-
-  /* Optional: force exact column widths */
-  .boq-grid {
-    grid-template-columns:
-      45mm   /* CODE */
-      1fr    /* DESCRIPTION */
-      18mm   /* QTY */
-      15mm   /* UNIT */
-      22mm   /* RATE */
-      25mm   /* SUBTOTAL */
-      18mm   /* FACTOR */
-      25mm;  /* TOTAL */
-  }
-}
