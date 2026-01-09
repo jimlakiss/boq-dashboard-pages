@@ -8,6 +8,11 @@
  *    (b) non-rate rows that carry values (QTY/SUBTOTAL/TOTAL != 0),
  *        even if those rows have children (e.g. "Trench Mesh" case)
  *
+ * NEW (CALCULATIONS):
+ * - SUBTOTAL = QTY × RATE, ONLY if SUBTOTAL cell is blank (CSV prevails)
+ * - TOTAL = SUBTOTAL × (1 + MARKUP%), ONLY if TOTAL cell is blank (CSV prevails)
+ * - If MARKUP blank, TOTAL = SUBTOTAL (when TOTAL blank)
+ *
  * No Bootstrap. Tailwind layout unchanged.
  *************************************************************/
 
@@ -88,8 +93,73 @@ function parseMoney(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
+function parsePercent(v) {
+  const n = parseFloat(String(v ?? "").replace(/[%\s]/g, "").trim());
+  return Number.isFinite(n) ? n : null;
+}
+
 function formatMoney(n) {
   return "$" + n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
+function cellHasUploadedValue(cellEl) {
+  // IMPORTANT: use text presence, not numeric > 0
+  // because "$0.00" or "0" are valid uploaded values.
+  return !!cellEl && String(cellEl.textContent ?? "").trim().length > 0;
+}
+
+/* ============================================================
+ * CALCULATIONS (NEW, DOES NOT OVERRIDE UPLOADED VALUES)
+ *
+ * Rules:
+ * - If SUBTOTAL cell has any text -> keep it.
+ *   Else if QTY and RATE are present -> SUBTOTAL = QTY × RATE
+ *
+ * - If TOTAL cell has any text -> keep it.
+ *   Else if SUBTOTAL is available (uploaded or computed):
+ *        If MARKUP cell has any text -> TOTAL = SUBTOTAL × (1 + %/100)
+ *        Else TOTAL = SUBTOTAL
+ * ============================================================ */
+function applyRowCalculations(allRows) {
+  for (const r of allRows) {
+    if (!r || !r.children) continue;
+
+    const qtyCell = r.children[COL.QTY];
+    const rateCell = r.children[COL.RATE];
+    const subtotalCell = r.children[COL.SUBTOTAL];
+    const markupCell = r.children[COL.MARKUP];
+    const totalCell = r.children[COL.TOTAL];
+
+    if (!qtyCell || !rateCell || !subtotalCell || !markupCell || !totalCell) continue;
+
+    // If subtotal uploaded, we preserve it.
+    let subtotal = null;
+
+    if (cellHasUploadedValue(subtotalCell)) {
+      subtotal = parseMoney(subtotalCell.textContent);
+    } else {
+      const qty = parseNumber(qtyCell.textContent);
+      const rate = parseMoney(rateCell.textContent);
+      if (qty !== 0 && rate !== 0) {
+        subtotal = qty * rate;
+        subtotalCell.textContent = formatMoney(subtotal);
+      }
+    }
+
+    // TOTAL: uploaded wins.
+    if (cellHasUploadedValue(totalCell)) continue;
+
+    if (subtotal !== null) {
+      let total = subtotal;
+
+      if (cellHasUploadedValue(markupCell)) {
+        const pct = parsePercent(markupCell.textContent);
+        if (pct !== null) total = subtotal * (1 + pct / 100);
+      }
+
+      totalCell.textContent = formatMoney(total);
+    }
+  }
 }
 
 /* ============================================================
@@ -209,13 +279,6 @@ function applyLevelPresentation(rowEl, code, codeCell, descCell, hierarchy) {
 
 /* ============================================================
  * ROLLUPS (FIXED, value-based contribution)
- *
- * A row contributes to rollups if:
- * - it is a RATE row, OR
- * - it carries any values (QTY or SUBTOTAL or TOTAL != 0)
- *
- * This fixes cases like "Trench Mesh" where a non-rate row has children
- * but still contains quantities that must roll up.
  * ============================================================ */
 function rowHasValues(rowEl) {
   const qty = parseNumber(rowEl.children[COL.QTY]?.textContent);
@@ -229,25 +292,41 @@ function recomputeAllRollups(allRows, hierarchy) {
 
   for (const node of nodes) {
     const nCode = node.dataset.code;
-    let qty = 0, subtotal = 0, total = 0;
+    let subtotal = 0;
+    let total = 0;
 
-    for (const r of allRows) {
-      const rCode = r.dataset.code;
-      if (!rCode) continue;
+    const rateChildren = hierarchy.rateChildrenOf.get(nCode) || [];
 
-      const contributes = isRate(rCode) || rowHasValues(r);
-      if (!contributes) continue;
+    if (rateChildren.length > 0) {
+      // 🔒 Sum ONLY direct child RATE rows
+      for (const rateCode of rateChildren) {
+        const r = allRows.find(row => row.dataset.code === rateCode);
+        if (!r) continue;
 
-      const base = stripRate(rCode);
+        subtotal += parseMoney(r.children[COL.SUBTOTAL]?.textContent);
+        total += parseMoney(r.children[COL.TOTAL]?.textContent);
+      }
+    } else {
+      // 🔁 Fallback: sum descendant values (SUBTOTAL + TOTAL only)
+      for (const r of allRows) {
+        const rCode = r.dataset.code;
+        if (!rCode) continue;
 
-      if (base === nCode || isDescendant(nCode, base)) {
-        qty += parseNumber(r.children[COL.QTY]?.textContent || 0);
-        subtotal += parseMoney(r.children[COL.SUBTOTAL]?.textContent || 0);
-        total += parseMoney(r.children[COL.TOTAL]?.textContent || 0);
+        const contributes = isRate(rCode) || rowHasValues(r);
+        if (!contributes) continue;
+
+        const base = stripRate(rCode);
+
+        if (base === nCode || isDescendant(nCode, base)) {
+          subtotal += parseMoney(r.children[COL.SUBTOTAL]?.textContent);
+          total += parseMoney(r.children[COL.TOTAL]?.textContent);
+        }
       }
     }
 
-    node.children[COL.QTY].textContent = qty ? String(qty) : "";
+    // 🔒 Parent rows never show quantity
+    node.children[COL.QTY].textContent = "";
+
     node.children[COL.SUBTOTAL].textContent = formatMoney(subtotal);
     node.children[COL.TOTAL].textContent = formatMoney(total);
   }
@@ -402,7 +481,7 @@ function renderFromCSV(data) {
   });
 }
 
-/* ================= STARTUP (unchanged) ================= */
+/* ================= STARTUP (ONLY CHANGE: CALCS BEFORE ROLLUPS) ================= */
 document.addEventListener("DOMContentLoaded", async () => {
   const res = await fetch(AUTO_CSV_PATH, { cache: "no-store" });
   const text = await res.text();
@@ -437,5 +516,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 
   initBoqUI(all, hierarchy);
+
+  // ✅ NEW: fill SUBTOTAL/TOTAL only when those cells are blank
+  applyRowCalculations(all);
+
+  // ✅ Rollups run after calculations
   recomputeAllRollups(all, hierarchy);
 });
