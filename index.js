@@ -24,7 +24,7 @@ const COL = {
 };
 
 /* ================= CONFIG ================= */
-const INDENT_PX = 14;           // ~3–5mm
+const INDENT_PX = 20;           // ~3–5mm
 const AUTO_CSV_PATH = "./boq.csv";
 
 /* ================= CODE UTILITIES ================= */
